@@ -3,6 +3,8 @@ add_triton_library(TritonToLinalg
         TLAToLinalgPass.cpp
         OffsetLoopRewrite.cpp
         MemoryPointer.cpp
+        VectorAddressLookahead.cpp
+        ExecutionPolicy.cpp
         LoadStoreConverter.cpp
         LegacyPointerConverters.cpp
         FunctionConverter.cpp
@@ -31,6 +33,7 @@ add_triton_library(TritonToLinalg
   MLIRTransforms
   MLIRSupport
   BiShengIRHIVMDialect
+  BiShengIRHACCUtils
   BiShengIRScopeDialect
   TritonIR
   TritonTransforms
