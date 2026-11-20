@@ -20,14 +20,19 @@
  * THE SOFTWARE.
  */
 
+#include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -71,6 +76,68 @@ public:
 
 namespace {
 
+// A constant penalty has no independent payload to preload. Keep its select
+// with the score addition, then let the existing i1 sinking move the predicate
+// chain to the same compute block. The packed byte load retains its own block.
+static bool isConstantTile(Value value) {
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+    auto elements = dyn_cast<DenseElementsAttr>(constant.getValue());
+    return elements && elements.isSplat();
+  }
+  if (auto fill = value.getDefiningOp<linalg::FillOp>())
+    return fill.getInputs().size() == 1 &&
+           fill.getInputs().front().getDefiningOp<arith::ConstantOp>();
+  return false;
+}
+
+static bool comesFromPackedDecode(Value value, unsigned depth = 0) {
+  if (depth > 32)
+    return false;
+  Operation *producer = value.getDefiningOp();
+  if (!producer)
+    return false;
+  if (producer->getName().getStringRef() == "hfusion.packed_mask_view" ||
+      isa<arith::ShRUIOp>(producer))
+    return true;
+  if (!isa<arith::CmpIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+           arith::SelectOp, arith::TruncIOp, arith::ExtUIOp,
+           tensor::CollapseShapeOp, tensor::ExpandShapeOp, linalg::BroadcastOp>(
+          producer))
+    return false;
+  return llvm::any_of(producer->getOperands(), [&](Value operand) {
+    return comesFromPackedDecode(operand, depth + 1);
+  });
+}
+
+static void sinkPackedPenalties(ModuleOp module,
+                                CVPipeline::ComputeBlockIdManager &bm,
+                                CVPipeline::MemoryDependenceGraph &memGraph) {
+  SmallVector<arith::SelectOp> candidates;
+  module.walk([&](arith::SelectOp select) {
+    auto type = dyn_cast<RankedTensorType>(select.getType());
+    if (type && isa<FloatType>(type.getElementType()) &&
+        select.getResult().hasOneUse() &&
+        isConstantTile(select.getTrueValue()) &&
+        isConstantTile(select.getFalseValue()) &&
+        comesFromPackedDecode(select.getCondition()))
+      candidates.push_back(select);
+  });
+  for (auto select : candidates) {
+    auto add = dyn_cast<arith::AddFOp>(*select.getResult().getUsers().begin());
+    if (!add || add->getBlock() != select->getBlock())
+      continue;
+    int sourceBlock = bm.getBlockIdByOp(select);
+    int targetBlock = bm.getBlockIdByOp(add);
+    if (sourceBlock < 0 || targetBlock < 0 || sourceBlock == targetBlock)
+      continue;
+    SmallVector<Operation *> group{select};
+    if (CVPipeline::willCreateCycle(group, memGraph, targetBlock, bm))
+      continue;
+    select->moveBefore(add);
+    bm.updateBlockId(select, targetBlock);
+  }
+}
+
 static bool isValidI1Producer(Operation *op) {
   if (isa<scf::SCFDialect>(op->getDialect())) {
     return false;
@@ -108,6 +175,9 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
   LOG_DEBUG(moduleOp);
   CVPipeline::ComputeBlockIdManager bm(moduleOp);
+  auto &aa = getAnalysis<AliasAnalysis>();
+  CVPipeline::MemoryDependenceGraph memGraph(moduleOp, aa);
+  sinkPackedPenalties(moduleOp, bm, memGraph);
   SmallVector<Operation *> producers;
   // find single-result and regionless op with i1 tensor result-type
   moduleOp.walk([&](Operation *op) {

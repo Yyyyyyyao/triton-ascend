@@ -72,6 +72,7 @@
 #include <numeric>
 #include <type_traits>
 
+
 #define DEBUG_TYPE "triton-load-store-converter"
 
 namespace LoadStoreConverter {
@@ -671,8 +672,35 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
                                   insertSliceOp.getDest(), insertSliceOp);
     rewriter.eraseOp(insertSliceOp);
   } else {
-    allocOp = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(memRefShape, memRefElementType));
+    bool isPackedMask =
+        memRefElementType.isInteger(8) && memRefShape.size() == 2 &&
+        llvm::all_of(memRefShape, [](int64_t size) { return size > 0; }) &&
+        llvm::any_of(op.getResult().getUsers(), [](Operation *user) {
+          return isa<hfusion::PackedMaskViewOp>(user);
+        });
+    if (isPackedMask && memRefShape[1] % 32 != 0) {
+      // The hint's physical access remains MxB bytes. Reserve 32-byte rows
+      // for the backend's predicate loads without expanding the GM access.
+      int64_t rows = memRefShape[0];
+      int64_t bytes = memRefShape[1];
+      int64_t rowBytes = llvm::alignTo(bytes, int64_t(32));
+      auto rawType = MemRefType::get({rows * rowBytes}, memRefElementType);
+      auto raw = rewriter.create<memref::AllocOp>(loc, rawType);
+      raw.setAlignmentAttr(rewriter.getI64IntegerAttr(32));
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      auto paddedType = MemRefType::get({rows, rowBytes}, memRefElementType);
+      Value padded = rewriter.create<memref::ViewOp>(loc, paddedType, raw, zero,
+                                                     ValueRange{});
+      SmallVector<OpFoldResult> offsets(2, rewriter.getIndexAttr(0));
+      SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(rows),
+                                      rewriter.getIndexAttr(bytes)};
+      SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
+      allocOp = rewriter.create<memref::SubViewOp>(loc, padded, offsets, sizes,
+                                                   strides);
+    } else {
+      allocOp = rewriter.create<memref::AllocOp>(
+          loc, MemRefType::get(memRefShape, memRefElementType));
+    }
   }
 
   // Deinterleaving must preserve the write that replaced the discrete loop's
